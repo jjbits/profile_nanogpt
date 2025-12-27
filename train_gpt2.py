@@ -2,6 +2,7 @@ import os
 import math
 import time
 import inspect
+import argparse
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -319,6 +320,11 @@ else:
 # pytorch can be serious about its device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
+# argument parsing for resume
+parser = argparse.ArgumentParser()
+parser.add_argument('--resume', type=str, default=None, help='path to checkpoint to resume from')
+args = parser.parse_args()
+
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
@@ -385,10 +391,23 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
 
-for step in range(max_steps):
+# resume from checkpoint if specified
+start_step = 0
+if args.resume:
+    if master_process:
+        print(f"Resuming from checkpoint: {args.resume}")
+    checkpoint = torch.load(args.resume, map_location=device)
+    raw_model.load_state_dict(checkpoint['model'])
+    start_step = checkpoint['step'] + 1
+    if master_process:
+        print(f"Resumed at step {start_step}, val_loss was {checkpoint['val_loss']:.4f}")
+else:
+    # only clear log file if starting fresh
+    with open(log_file, "w") as f:
+        pass
+
+for step in range(start_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
