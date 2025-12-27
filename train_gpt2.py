@@ -397,7 +397,7 @@ start_step = 0
 if args.resume:
     if master_process:
         print(f"Resuming from checkpoint: {args.resume}")
-    checkpoint = torch.load(args.resume, map_location=device)
+    checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
     raw_model.load_state_dict(checkpoint['model'])
     start_step = checkpoint['step'] + 1
     if master_process:
