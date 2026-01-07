@@ -124,6 +124,79 @@ After removing `torch.cuda.synchronize()`, the actual improvement was **much bet
 
 ---
 
+## NCU Kernel Profiling
+
+Used NVIDIA Nsight Compute (NCU) to profile individual kernel among top 10 long runnig kernels. Focused on Triton-generated kernels and Flash Attention since GEMM (cuBLAS) are already highly optimized.
+
+### Triton Kernels
+
+| Kernel | Duration/call | Calls/step | Total/step | Memory BW | Compute | Bottleneck |
+|--------|---------------|------------|------------|-----------|---------|------------|
+| `triton_loss_bwd` | 6.76ms | ~10 | ~68ms | **87.2%** | 60.9% | Memory-bound |
+| `triton_gelu` | 386µs | ~120 | ~46ms | **91.8%** | 69.6% | Memory-bound |
+| `triton_log_softmax_fwd` | 4.24ms | ~10 | ~42ms | 46.5% | **81.3%** | Compute-bound |
+
+### Flash Attention Kernels
+
+| Kernel | Duration/call | Calls/step | Total/step | Memory BW | Compute | Bottleneck |
+|--------|---------------|------------|------------|-----------|---------|------------|
+| `flash_fwd` | 566µs | ~120 | ~68ms | 36.5% | 47.2% | Latency-bound |
+| `flash_bwd` | 1.45ms | ~120 | ~174ms | 58.7% | 38.5% | Latency-bound |
+
+> **Latency-bound**: Neither compute nor memory bandwidth is saturated, yet utilization is low. GPUs normally hide memory latency by switching between many warps while waiting for data. With only ~2 warps per scheduler, there's nothing to switch to, so memory latency cannot be hidden. NCU shows 50-65% of cycles are idle with no eligible warp to execute.
+
+#### Why Low Utilization is by Design
+
+Flash Attention deliberately **sacrifices GPU occupancy to eliminate memory bottlenecks**.
+
+| | Traditional Attention | Flash Attention |
+|--|----------------------|-----------------|
+| Occupancy | ~100% | **12.5%** |
+| Registers/thread | ~32 | **255 (maxed)** |
+| Shared memory | Minimal | **49-147 KB/block** |
+| HBM access | O(N²) | **O(N)** |
+
+```
+Traditional: High parallelism, but drowns in memory traffic
+             ┌──────┐
+   GPU ←───→ │ HBM  │ ←── N² attention matrix bottleneck
+             └──────┘
+
+Flash: Low parallelism, but data stays on-chip
+             ┌──────┐
+   GPU ←─×─→ │ HBM  │ ←── Minimal traffic
+     ↓       └──────┘
+   ┌──────┐
+   │ SRAM │ ←── All computation happens here
+   └──────┘
+```
+
+**NCU evidence - maxed-out on-chip resources:**
+
+| Metric | flash_fwd | flash_bwd | H100 Limit |
+|--------|-----------|-----------|------------|
+| Registers/Thread | 255 | 255 | 255 (maxed) |
+| Shared Memory/Block | 49 KB | 147 KB | 227 KB |
+| Theoretical Occupancy | 12.5% | 12.5% | 100% |
+
+**NCU evidence - effective cache reuse from tiling:**
+
+| Metric | flash_fwd | flash_bwd |
+|--------|-----------|-----------|
+| L2 Hit Rate | 67.5% | 72.1% |
+| DRAM Throughput | 21.6% | 20.7% |
+
+**NCU evidence - low parallelism (the cost of staying on-chip):**
+
+| Metric | flash_fwd | flash_bwd | Max |
+|--------|-----------|-----------|-----|
+| Active Warps/Scheduler | 1.98 | 1.99 | 16 |
+| No Eligible Warp Cycles | 50.9% | 65.6% | - |
+| Tensor Core Utilization | 40.9% | 39.6% | 100% |
+
+
+---
+
 ## Bonus: Cloud Provider Comparison (RunPod vs Lambda)
 
 We ran identical profiling on two cloud providers with the same GPU configuration (4x H100 NVLink). The results were surprisingly different(ran with the torch.cuda.synchronize()):
